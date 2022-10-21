@@ -1,0 +1,152 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+)
+
+type Thought struct {
+	Preview string `json:"preview"`
+	Title   string `json:"title"`
+	History string `json:"history"`
+}
+type Queue struct {
+	name             string
+	durable          bool
+	deleteWhenUnused bool
+	exclusive        bool
+	noWait           bool
+}
+type Consume struct {
+	queueName string
+	consumer  string
+	autoAck   bool
+	exclusive bool
+	noLocal   bool
+	noWait    bool
+}
+
+func handleError(err error) {
+	if err != nil {
+		println("--------------------------")
+		println("|azure-storage-mock died.|")
+		println("--------------------------")
+		fmt.Print(err)
+		log.Panic()
+	}
+}
+
+func main() {
+	// Get Environment Variables
+	port := os.Getenv("PORT")
+	rabbitmqPort := os.Getenv("RABBITMQ_URL")
+	if port == "" || rabbitmqPort == "" {
+		println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+		println("!!! please provide env variables. !!!")
+		println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+		log.Panic()
+	}
+
+	// Waits for rabbitmq
+	time.Sleep(time.Second * 7)
+
+	// Wires with rabbitmq
+	conn, err := amqp.Dial(rabbitmqPort)
+	handleError(err)
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	handleError(err)
+	defer ch.Close()
+
+	queueArgs := Queue{
+		name:             "newThought",
+		durable:          false,
+		deleteWhenUnused: false,
+		exclusive:        false,
+		noWait:           false,
+	}
+	q, err := ch.QueueDeclare(
+		queueArgs.name,
+		queueArgs.durable,
+		queueArgs.deleteWhenUnused,
+		queueArgs.exclusive,
+		queueArgs.noWait,
+		nil,
+	)
+	handleError(err)
+
+	// Declare channel as consumer
+	msg, err := ch.Consume(
+		q.Name,
+		"",
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	handleError(err)
+
+	// Creates context, acts as fake storage
+	thoughts := &[]Thought{}
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	defer cancelCtx()
+	contx := context.WithValue(ctx, Thought{}, thoughts)
+
+	// When a message arrives call insert
+	go func() {
+		for d := range msg {
+			insert(contx, d.Body)
+		}
+	}()
+
+	// Basic http server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/queryAllThoughts", getAll)
+	server := &http.Server{
+		Addr:    ":" + port,
+		Handler: mux,
+		BaseContext: func(_ net.Listener) context.Context {
+			return contx
+		},
+	}
+
+	println("------------------")
+	println("azure-storage-mock\nis up and running!")
+	println("------------------")
+	server.ListenAndServe()
+}
+
+func getAll(w http.ResponseWriter, r *http.Request) {
+	// Gets Thoughts List from context
+	ctx := r.Context()
+	thoughtList := ctx.Value(Thought{}).(*[]Thought)
+
+	// Converts thoughts to JSON
+	jsonData, err := json.Marshal(thoughtList)
+	handleError(err)
+
+	w.Write(jsonData)
+}
+
+func insert(ctx context.Context, thought []byte) {
+	// Gets Thoughts List from context
+	thoughtList := ctx.Value(Thought{}).(*[]Thought)
+
+	// Parses JSON into Struct
+	var data *Thought
+	err := json.Unmarshal(thought, &data)
+	handleError(err)
+
+	// Inserts Thought Struct into slice
+	*thoughtList = append(*thoughtList, *data)
+}
